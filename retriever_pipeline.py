@@ -1,12 +1,44 @@
+import os
+
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+
 from ingestion.embedder import embed_texts
 from ingestion.vector_store import get_collection, query
-from langchain_google_genai import ChatGoogleGenerativeAI
-from dotenv import load_dotenv
-import os
 
 load_dotenv()
 
+MODEL_NAME = "gemini-3.5-flash-lite"
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is not set (check that .env exists)")
+
+ANSWER_SYSTEM_PROMPT = (
+    "You are an assistant that transforms and converts the given question and the "
+    "given embeddings into a meaningful answer that is short and understandable to "
+    "the user. If the question is not related to the given embeddings, respond with "
+    "'I don't have the answer to this question.'."
+)
+
+CONDENSE_SYSTEM_PROMPT = (
+    "You are an assistant that rewrites the user's question into a single, "
+    "self-contained question using the previous question/answer pairs as context. "
+    "Keep it short and understandable to the user."
+)
+
+LLM = ChatGoogleGenerativeAI(model=MODEL_NAME, api_key=GEMINI_API_KEY)
+
+
+def _as_text(response) -> str:
+    # Gemini responses can return str or a list of content parts (with
+    # signature metadata); flatten to plain text either way.
+    content = response.content
+    if isinstance(content, str):
+        return content
+    return "".join(
+        part.get("text", "") for part in content if isinstance(part, dict)
+    )
 
 
 def retrieve(question: str, n_results: int = 5) -> list[dict]:
@@ -36,22 +68,48 @@ def answer_question(question: str, n_results: int = 5) -> str:
     return retrieved[0]["document"]
 
 
-def format_answer(formatted_question):
-    model = ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite", api_key=GEMINI_API_KEY)
+def format_answer(formatted_question: str) -> str:
     messages = [
-    ("system", "You are an assistant that transforms and converts the given question and the given embeddings into a meaningful answer that is short and understandable to the user"),
-    ("human", formatted_question),
+        ("system", ANSWER_SYSTEM_PROMPT),
+        ("human", formatted_question),
     ]
-    response = model.invoke(messages)
-    return response.text
+    response = LLM.invoke(messages)
+    return _as_text(response)
+
+
+def format_chain_question(history: list[tuple[str, str]], question: str) -> str:
+    history_text = "\n".join(f"Q: {q}\nA: {a}" for q, a in history)
+    messages = [
+        ("system", CONDENSE_SYSTEM_PROMPT),
+        ("human", f"History:\n{history_text}\n\nQuestion: {question}"),
+    ]
+    response = LLM.invoke(messages)
+    return _as_text(response)
 
 
 if __name__ == "__main__":
-    question = input("Question: ").strip()
-    answer = answer_question(question)
-    formatted_question = f"""
-    Question: {question}
-    Embeddings: {answer}
-    """
-    formatted_answer = format_answer(formatted_question)
-    print(f"\nAnswer:\n{formatted_answer}")
+    history: list[tuple[str, str]] = []
+    while True:
+        try:
+            question = input("Question: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if question == "exit":
+            break
+
+        formatted_question = (
+            question if not history else format_chain_question(history, question)
+        )
+        print("Formatted Question:", formatted_question)
+
+        answer = answer_question(formatted_question)
+        formatted_question_with_embeddings = (
+            f"Question: {question}\n"
+            f"Condensed question: {formatted_question}\n"
+            f"Retrieved context: {answer}"
+        )
+
+        formatted_answer = format_answer(formatted_question_with_embeddings)
+        print(f"\nAnswer:\n{formatted_answer}")
+
+        history.append((question, formatted_answer))
